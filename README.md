@@ -1,127 +1,128 @@
 # llmcache
 
-A unified **explicit-caching** control plane for LLM serving platforms.
+**Explicit KV caching for LLM serving engines.**
 
-Declare reusable prompt content once — a system instruction, a large document, a
-few-shot block, a tool catalogue — get a portable handle back, and reference it
-across many requests. The same API drives platforms with a native cache object
-(Google Gemini) and platforms that only have prefix / prompt caching (vLLM,
-SGLang, OpenAI, Anthropic).
+An [LMCache](https://github.com/LMCache/LMCache)-style KV offload and reuse layer
+— but **explicit**. Instead of automatically hashing token content and scanning
+for the longest shared prefix, your application registers KV under a **cache id**
+(a handle it owns) and references that handle deliberately. The trade is intent
+for determinism.
 
-## Why "explicit"?
+## Explicit vs. automatic (why)
 
-LLM serving engines reuse work in two ways:
+LMCache reuses KV implicitly: it chunks every request, hashes the tokens, and
+looks for the longest matching prefix already in its store (CPU, disk, remote). It
+is powerful and zero-touch, but reuse is best-effort and opaque — you don't decide
+what is cached, when it warms, or whether it survives memory pressure.
 
-- **Implicit / automatic prefix caching** — the engine notices that two requests
-  share a prefix and reuses the computed KV blocks (vLLM `--enable-prefix-caching`,
-  SGLang RadixAttention, OpenAI automatic prompt caching). You don't control *what*
-  is cached or *when* it warms.
-- **Explicit caching** — you declare the content to cache, get a handle/TTL, and
-  reference it deliberately (Gemini `cachedContents`, Anthropic `cache_control`
-  breakpoints).
+`llmcache` makes caching a first-class, explicit operation:
 
-`llmcache` gives you the **explicit** model everywhere. For native platforms it
-calls the real cache API. For prefix-cache platforms it tracks the prefix + TTL
-for you and re-materialises it into each request (optionally warming the engine
-first), so you get the same create/reference/expire workflow regardless of where
-you serve.
+| | LMCache (automatic) | llmcache (explicit) |
+|---|---|---|
+| Lookup key | rolling hash of token content | application-owned cache id |
+| Hit semantics | best-effort longest-prefix match | deterministic, O(1) by id |
+| Eviction | LRU under memory pressure | **pinning** — guaranteed-resident caches |
+| Warming | on first matching request | register/precompute **offline**, ahead of traffic |
+| False sharing | possible across tenants/prompts | impossible (ids are explicit) |
+| Correctness guard | token match | token-fingerprint prefix check on reuse |
+
+You still get tiered storage (CPU → disk → remote) and prefix-level partial reuse;
+you just drive it on purpose. Great for: shared system prompts, RAG document packs,
+long few-shot blocks, agent tool catalogues, and multi-tenant isolation.
+
+## Architecture
+
+```
+            ┌─────────────────────────────────────────────┐
+            │            ExplicitKVCache (engine)          │  control plane:
+            │   register · lookup · load · pin · ttl       │  ids → chunks, fingerprints
+            └───────────────┬─────────────────────────────┘
+                            │ opaque KVPayload chunks
+            ┌───────────────▼─────────────────────────────┐
+            │  StorageBackend: CPU → Disk → (remote)       │  tiered, LRU + pinning
+            └───────────────┬─────────────────────────────┘
+                            │ KVTransfer (tensor copy)
+   ┌────────────────────────▼──────────────┐   ┌───────────────────────────┐
+   │ ExplicitLMCacheConnector (vLLM V1)     │   │ SGLangExplicitCache (hook) │
+   └────────────────────────────────────────┘   └───────────────────────────┘
+```
+
+The engine and storage layers are **tensor- and framework-agnostic** — they index
+opaque payloads — so the whole control plane runs and is tested without torch or a
+GPU. Real KV crosses the boundary only inside a `KVTransfer` adapter at the
+connector.
 
 ## Install
 
 ```bash
-pip install -e .            # core, zero dependencies
-pip install -e ".[openai]"  # + openai SDK (also used for vLLM / SGLang servers)
-pip install -e ".[anthropic]"
-pip install -e ".[gemini]"
+pip install -e .            # core engine + storage + connectors (zero deps)
+pip install -e ".[torch]"   # + torch/numpy for real KV (de)serialization
+pip install -e ".[dev]"     # + pytest
 ```
 
-## Quickstart
+## Quickstart (engine, offline)
 
 ```python
-from llmcache import ExplicitCache
+from llmcache import ExplicitKVCache, CPUBackend, DiskBackend, TieredBackend
 
-cache = ExplicitCache("vllm")  # or "sglang", "openai", "anthropic", "gemini", "memory"
+store = TieredBackend(CPUBackend(capacity_bytes=8 << 30), DiskBackend("/var/kvcache"))
+engine = ExplicitKVCache(store, chunk_size=256)
 
-handle = cache.create(
-    model="meta-llama/Llama-3.1-8B-Instruct",
-    system="You are an HR assistant. Answer only from the handbook.",
-    content=[{"role": "user", "content": LONG_HANDBOOK_TEXT}],
-    ttl=3600,
-    name="handbook-v1",
-)
+# Register KV for a prompt under an explicit, pinned handle.
+engine.register(prompt_token_ids, kv_payloads, cache_id="handbook-v1", ttl=3600, pin=True)
 
-request = cache.build_request(
-    handle,
-    [{"role": "user", "content": "How many vacation days do I get?"}],
-    max_tokens=256,
-)
-# `request` is the platform-native payload, with the cached prefix attached.
+# Later requests reference it; partial prefix reuse is verified by fingerprint.
+result = engine.lookup("handbook-v1", request_token_ids)
+print(result.num_tokens, "tokens reusable")
+payloads = engine.load("handbook-v1", num_chunks=result.num_chunks)
 ```
 
-### Going live
+## vLLM integration
 
-Pass the platform's SDK client and let `llmcache` warm, reference, and (for native
-caches) create/delete the server-side object:
+`ExplicitLMCacheConnector` implements vLLM's V1 `KVConnectorBase_V1`. Requests opt
+in via `kv_transfer_params` on `SamplingParams`:
 
 ```python
-from openai import OpenAI
-from llmcache import ExplicitCache
+# reuse a registered cache
+SamplingParams(extra_args={"kv_transfer_params": {"cache_id": "handbook-v1"}})
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="x")
-cache = ExplicitCache("vllm", client=client)        # warms the prefix on create()
-
-handle = cache.create(model="meta-llama/Llama-3.1-8B-Instruct", content=docs, ttl=600)
-resp = cache.complete(handle, [{"role": "user", "content": "Q?"}])
+# create/refresh a cache from this request's computed KV
+SamplingParams(extra_args={"kv_transfer_params": {
+    "cache_id": "handbook-v1", "save": True, "ttl": 3600, "pin": True, "name": "handbook",
+}})
 ```
 
-```python
-from google import genai
-from llmcache import ExplicitCache
+Scheduler side: `get_num_new_matched_tokens` reports how much KV is reusable for
+that id (verified against the prompt prefix); `build_connector_meta` ships per-request
+load/save ops to the workers. Worker side: `start_load_kv` copies cached KV into the
+paged buffer via a `KVTransfer`; `wait_for_save` captures and registers new KV.
 
-cache = ExplicitCache("gemini", client=genai.Client())  # uses native cachedContents
-handle = cache.create(model="gemini-2.0-flash", content=docs, ttl=600)
-resp = cache.complete(handle, [{"role": "user", "content": "Q?"}])
-```
+> **Tensor copy maturity.** The engine, storage, scheduling, and metadata logic are
+> covered by the test suite. The torch paged-buffer copy (`TorchKVTransfer`) is
+> framework- and vLLM-version-sensitive and is **not** exercised here — validate it
+> against your target vLLM build before production. `DictKVTransfer` lets you dry-run
+> the entire connector lifecycle without torch (see `examples/quickstart.py`).
 
-## Supported platforms
+## SGLang integration
 
-| Platform   | Backend name | Mechanism                                  | Native cache API |
-|------------|--------------|--------------------------------------------|------------------|
-| vLLM       | `vllm`       | automatic prefix caching + warm-up         | no               |
-| SGLang     | `sglang`     | RadixAttention prefix caching + warm-up    | no               |
-| OpenAI     | `openai`     | implicit prompt caching                    | no               |
-| Anthropic  | `anthropic`  | `cache_control` breakpoints                | no (request-level)|
-| Gemini     | `gemini`     | `cachedContents`                           | yes              |
-| in-memory  | `memory`     | reference backend for tests / local dev    | no               |
+`SGLangExplicitCache` exposes the same engine through a `store`/`retrieve` surface
+suitable for SGLang's host KV cache hook, so a cache registered for vLLM is reusable
+from SGLang and vice-versa.
 
-## API
+## API surface
 
-- `ExplicitCache(backend, **client_kwargs)` — `backend` is a platform name or a
-  `CacheBackend` instance.
-- `.create(model=..., content=..., system=..., tools=..., ttl=..., name=...) -> CacheHandle`
-- `.get(ref)`, `.list()`, `.delete(ref)`, `.extend(ref, ttl)`
-- `.build_request(ref, messages, **params) -> dict` — platform-native payload.
-- `.complete(ref, messages, **params)` — runs it via the configured client.
-
-`ref` may be a `CacheHandle`, a `CacheEntry`, or a raw cache id string.
-
-### Adding a platform
-
-Subclass `LocalPrefixCacheBackend` (prefix-cache style) or `CacheBackend`
-(native), then register it:
-
-```python
-from llmcache import LocalPrefixCacheBackend, register_backend
-
-class MyEngineBackend(LocalPrefixCacheBackend):
-    name = "myengine"
-
-register_backend("myengine", MyEngineBackend)
-```
+- `ExplicitKVCache(store=None, *, chunk_size=256, default_ttl=None)`
+  - `.register(token_ids, payloads, *, cache_id=None, ttl=None, pin=False, name=None)`
+  - `.lookup(cache_id, request_tokens=None) -> LookupResult`
+  - `.load(cache_id, *, num_chunks=None, worker_id=0) -> list[KVPayload]`
+  - `.get / .exists / .list / .delete / .extend_ttl / .pin / .unpin / .sweep_expired / .stats`
+  - low-level: `.put_chunk(...)`, `.commit(...)` (used by connectors)
+- Storage: `CPUBackend`, `DiskBackend`, `TieredBackend` (implement `StorageBackend` to add Redis/S3/…)
+- Payload: `KVPayload`, `RawSerializer`, `TorchSerializer`
+- Connectors: `ExplicitLMCacheConnector`, `SGLangExplicitCache`, `KVTransfer` (`DictKVTransfer`, `TorchKVTransfer`)
 
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest
+pip install -e ".[dev]" && pytest
 ```

@@ -1,132 +1,101 @@
-"""Core data types shared across backends.
+"""Core data types for the explicit KV cache.
 
-The model here is deliberately small. Explicit caching is about declaring a
-*prefix* of a request — typically a system instruction plus some large, reused
-context (documents, few-shot examples, a tool catalogue) — once, getting a
-handle back, and then referencing that handle on many subsequent requests so the
-prefix does not have to be re-sent or re-computed.
+Unlike LMCache, which keys stored KV by a rolling hash of the *token content* and
+matches new requests by scanning for the longest shared prefix, llmcache keys KV
+by an **explicit cache id** (a handle the application owns). A handle covers an
+ordered, contiguous run of tokens split into fixed-size chunks; each chunk is one
+stored object. Lookups are O(1) by id, hits are deterministic, and entries can be
+pinned so they are never silently evicted.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Optional, Sequence
+
+
+@dataclass(frozen=True)
+class ChunkKey:
+    """Storage key for a single KV chunk belonging to a cache handle."""
+
+    cache_id: str
+    chunk_index: int
+    # worker_id distinguishes tensor-parallel shards that hold different KV.
+    worker_id: int = 0
+
+    def __str__(self) -> str:
+        return f"{self.cache_id}@{self.worker_id}#{self.chunk_index}"
+
+
+def token_fingerprint(tokens: Sequence[int]) -> str:
+    """Stable short fingerprint of a token run, used to validate prefix match."""
+    h = hashlib.blake2b(digest_size=16)
+    for t in tokens:
+        h.update(int(t).to_bytes(4, "little", signed=True))
+    return h.hexdigest()
 
 
 @dataclass
-class Message:
-    """A single chat message used to describe cached content."""
+class CacheDescriptor:
+    """Metadata the engine keeps for one registered explicit cache."""
 
-    role: str
-    content: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"role": self.role, "content": self.content}
-
-
-MessageLike = Union[Message, Mapping[str, Any]]
-
-
-def coerce_message(m: MessageLike) -> Message:
-    if isinstance(m, Message):
-        return m
-    if isinstance(m, Mapping):
-        try:
-            return Message(role=str(m["role"]), content=str(m["content"]))
-        except KeyError as exc:  # pragma: no cover - defensive
-            raise ValueError(f"message mapping missing key: {exc}") from exc
-    raise TypeError(f"cannot coerce {type(m)!r} into a Message")
-
-
-def coerce_messages(messages: Sequence[MessageLike]) -> list[Message]:
-    return [coerce_message(m) for m in messages]
-
-
-class CacheStatus(str, Enum):
-    ACTIVE = "active"
-    EXPIRED = "expired"
-    DELETED = "deleted"
-
-
-@dataclass
-class CacheSpec:
-    """Describes content that should be cached.
-
-    ``content`` is the reusable prefix. ``system`` is broken out because several
-    platforms treat the system instruction specially (Anthropic ``system`` block,
-    Gemini ``systemInstruction``). ``ttl`` is in seconds; ``None`` means "use the
-    backend default".
-    """
-
-    model: str
-    content: list[Message] = field(default_factory=list)
-    system: Optional[str] = None
-    tools: Optional[list[Any]] = None
-    ttl: Optional[float] = None
-    name: Optional[str] = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.content = coerce_messages(self.content)
-
-    def approx_tokens(self) -> int:
-        """Rough token estimate (~4 chars/token) used for usage metrics only."""
-        chars = len(self.system or "")
-        for m in self.content:
-            chars += len(m.content)
-        return chars // 4
-
-
-@dataclass
-class CacheUsage:
-    hits: int = 0
-    tokens_cached: int = 0
-    last_used_at: Optional[float] = None
-
-
-@dataclass
-class CacheHandle:
-    """A portable reference to a cache entry returned to callers."""
-
-    id: str
-    backend: str
-    model: str
+    cache_id: str
+    num_tokens: int
+    chunk_size: int
+    num_layers: int
+    worker_ids: tuple[int, ...]
     created_at: float
     expires_at: Optional[float]
+    pinned: bool
+    # Per-chunk fingerprint of the covered tokens, so a request can be verified
+    # to actually share this prefix before its KV is reused.
+    chunk_fingerprints: list[str] = field(default_factory=list)
     name: Optional[str] = None
-
-    @staticmethod
-    def new(backend: str, model: str, ttl: Optional[float], name: Optional[str]) -> "CacheHandle":
-        now = time.time()
-        return CacheHandle(
-            id=uuid.uuid4().hex,
-            backend=backend,
-            model=model,
-            created_at=now,
-            expires_at=(now + ttl) if ttl is not None else None,
-            name=name,
-        )
-
-
-@dataclass
-class CacheEntry:
-    """Full server-side record for a cache entry."""
-
-    handle: CacheHandle
-    spec: CacheSpec
-    status: CacheStatus = CacheStatus.ACTIVE
-    usage: CacheUsage = field(default_factory=CacheUsage)
-    # Some platforms (e.g. Gemini) mint their own id; we keep it for native calls.
-    native_id: Optional[str] = None
+    hits: int = 0
+    last_used_at: Optional[float] = None
 
     @property
-    def id(self) -> str:
-        return self.handle.id
+    def num_chunks(self) -> int:
+        return len(self.chunk_fingerprints)
 
     def is_expired(self, now: Optional[float] = None) -> bool:
-        if self.handle.expires_at is None:
+        if self.expires_at is None:
             return False
-        return (now or time.time()) >= self.handle.expires_at
+        return (now or time.time()) >= self.expires_at
+
+    @staticmethod
+    def new_id() -> str:
+        return uuid.uuid4().hex
+
+
+def chunk_token_ids(tokens: Sequence[int], chunk_size: int) -> list[list[int]]:
+    """Split a token sequence into fixed-size chunks (last may be short)."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    return [list(tokens[i : i + chunk_size]) for i in range(0, len(tokens), chunk_size)]
+
+
+def matched_chunk_count(
+    request_tokens: Sequence[int],
+    descriptor: "CacheDescriptor",
+) -> int:
+    """How many cached chunks are a valid prefix of ``request_tokens``.
+
+    Returns the count of leading chunks whose token fingerprints match. Stops at
+    the first divergence (explicit caches are prefix caches: a partial mismatch
+    truncates reuse rather than failing).
+    """
+    chunks = chunk_token_ids(request_tokens, descriptor.chunk_size)
+    matched = 0
+    for i, fp in enumerate(descriptor.chunk_fingerprints):
+        if i >= len(chunks):
+            break
+        # A short final cached chunk can only match if the request has at least
+        # that many tokens in the corresponding position.
+        if token_fingerprint(chunks[i]) != fp:
+            break
+        matched += 1
+    return matched

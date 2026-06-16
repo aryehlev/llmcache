@@ -1,63 +1,66 @@
-"""llmcache — a unified explicit-caching control plane for LLM serving platforms.
+"""llmcache — explicit KV caching for LLM serving engines.
 
-Declare reusable prompt content (system instructions, documents, few-shot
-examples, tool catalogues) once, get a portable handle, and reference it across
-many requests. The same API drives native explicit caches (Gemini) and
-prefix/prompt caches (vLLM, SGLang, OpenAI, Anthropic).
+An LMCache-style KV offload/reuse layer, but **explicit**: applications register
+KV under a cache id and reference it deliberately, instead of relying on automatic
+token-hash prefix matching. Deterministic hits, pinning, offline warming, and
+cross-request sharing with no false matches.
+
+Layers:
+
+* :class:`ExplicitKVCache` — the control plane (register / lookup / load / pin /
+  TTL), tensor- and storage-agnostic.
+* ``store`` — :class:`CPUBackend`, :class:`DiskBackend`, :class:`TieredBackend`.
+* ``connectors`` — :class:`ExplicitLMCacheConnector` (vLLM V1) and
+  :class:`SGLangExplicitCache`, plus :class:`KVTransfer` adapters.
 """
 
 from __future__ import annotations
 
-from .backend import CacheBackend, LocalPrefixCacheBackend
-from .backends.anthropic import AnthropicBackend
-from .backends.gemini import GeminiBackend
-from .backends.memory import MemoryBackend
-from .backends.openai import OpenAIBackend
-from .backends.sglang import SGLangBackend
-from .backends.vllm import VLLMBackend
+from .engine import ExplicitKVCache, LookupResult
 from .errors import (
-    BackendError,
     CacheError,
     CacheExpiredError,
+    CacheMismatchError,
     CacheNotFoundError,
-    UnsupportedOperationError,
+    ConnectorError,
+    SerializationError,
+    StorageFullError,
 )
-from .manager import ExplicitCache
-from .registry import available_backends, get_backend, register_backend
+from .payload import KVPayload, KVSerializer, RawSerializer, TorchSerializer
+from .store import CPUBackend, DiskBackend, StorageBackend, StoreStats, TieredBackend
 from .types import (
-    CacheEntry,
-    CacheHandle,
-    CacheSpec,
-    CacheStatus,
-    CacheUsage,
-    Message,
+    CacheDescriptor,
+    ChunkKey,
+    chunk_token_ids,
+    matched_chunk_count,
+    token_fingerprint,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
-    "ExplicitCache",
-    "CacheBackend",
-    "LocalPrefixCacheBackend",
-    "MemoryBackend",
-    "VLLMBackend",
-    "SGLangBackend",
-    "OpenAIBackend",
-    "AnthropicBackend",
-    "GeminiBackend",
-    "get_backend",
-    "register_backend",
-    "available_backends",
-    "CacheSpec",
-    "CacheHandle",
-    "CacheEntry",
-    "CacheStatus",
-    "CacheUsage",
-    "Message",
+    "ExplicitKVCache",
+    "LookupResult",
+    "CacheDescriptor",
+    "ChunkKey",
+    "chunk_token_ids",
+    "matched_chunk_count",
+    "token_fingerprint",
+    "KVPayload",
+    "KVSerializer",
+    "RawSerializer",
+    "TorchSerializer",
+    "StorageBackend",
+    "StoreStats",
+    "CPUBackend",
+    "DiskBackend",
+    "TieredBackend",
     "CacheError",
     "CacheNotFoundError",
     "CacheExpiredError",
-    "UnsupportedOperationError",
-    "BackendError",
+    "CacheMismatchError",
+    "StorageFullError",
+    "SerializationError",
+    "ConnectorError",
     "__version__",
 ]
