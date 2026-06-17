@@ -27,7 +27,14 @@ from .errors import (
     StorageFullError,
 )
 from .payload import KVPayload, KVSerializer, RawSerializer, TorchSerializer
-from .store import CPUBackend, DiskBackend, StorageBackend, StoreStats, TieredBackend
+from .store import (
+    CPUBackend,
+    DiskBackend,
+    RedisBackend,
+    StorageBackend,
+    StoreStats,
+    TieredBackend,
+)
 from .types import (
     CacheDescriptor,
     ChunkKey,
@@ -54,6 +61,7 @@ __all__ = [
     "StoreStats",
     "CPUBackend",
     "DiskBackend",
+    "RedisBackend",
     "TieredBackend",
     "CacheError",
     "CacheNotFoundError",

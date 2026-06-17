@@ -55,8 +55,9 @@ connector.
 ## Install
 
 ```bash
-pip install -e .            # core engine + storage + connectors (zero deps)
+pip install -e .            # core engine + storage + connectors + CLI (zero deps)
 pip install -e ".[torch]"   # + torch/numpy for real KV (de)serialization
+pip install -e ".[redis]"   # + redis-py for the remote/shared tier
 pip install -e ".[dev]"     # + pytest
 ```
 
@@ -66,6 +67,9 @@ pip install -e ".[dev]"     # + pytest
 from llmcache import ExplicitKVCache, CPUBackend, DiskBackend, TieredBackend
 
 store = TieredBackend(CPUBackend(capacity_bytes=8 << 30), DiskBackend("/var/kvcache"))
+# or share caches across a fleet via Redis:
+#   from llmcache import RedisBackend
+#   store = TieredBackend(CPUBackend(8 << 30), RedisBackend(url="redis://host:6379", key_ttl=3600))
 engine = ExplicitKVCache(store, chunk_size=256)
 
 # Register KV for a prompt under an explicit, pinned handle.
@@ -98,16 +102,42 @@ load/save ops to the workers. Worker side: `start_load_kv` copies cached KV into
 paged buffer via a `KVTransfer`; `wait_for_save` captures and registers new KV.
 
 > **Tensor copy maturity.** The engine, storage, scheduling, and metadata logic are
-> covered by the test suite. The torch paged-buffer copy (`TorchKVTransfer`) is
-> framework- and vLLM-version-sensitive and is **not** exercised here — validate it
-> against your target vLLM build before production. `DictKVTransfer` lets you dry-run
-> the entire connector lifecycle without torch (see `examples/quickstart.py`).
+> covered by the test suite. `TorchKVTransfer` has a torch-level roundtrip test
+> (`tests/test_torch_transfer.py`) that stands up a buffer shaped like vLLM's paged
+> KV cache (`[2, num_blocks, block_size, heads, head_dim]` per layer) and checks
+> save → load reproduces KV exactly — but vLLM paged layouts shift across releases,
+> so **validate against your target vLLM build** before production. `DictKVTransfer`
+> lets you dry-run the whole connector lifecycle without torch (see
+> `examples/quickstart.py`).
 
 ## SGLang integration
 
 `SGLangExplicitCache` exposes the same engine through a `store`/`retrieve` surface
 suitable for SGLang's host KV cache hook, so a cache registered for vLLM is reusable
 from SGLang and vice-versa.
+
+## Management: control server + CLI
+
+The engine lives inside the serving process (the connector holds it). Embed a
+`ControlServer` beside it to expose cache lifecycle over a small JSON/REST API
+(stdlib only, no web framework), then drive it with the `llmcache` CLI:
+
+```bash
+# run a control server over a chosen storage tier
+llmcache serve --store tiered --disk-path /var/kvcache --redis-url redis://localhost:6379
+
+# manage caches in a running server
+llmcache list
+llmcache get handbook-v1
+llmcache pin handbook-v1          # guarantee residency
+llmcache ttl handbook-v1 7200     # reset TTL (seconds)
+llmcache delete handbook-v1
+llmcache stats
+llmcache register spec.json       # register a precomputed cache (token_ids + base64 payloads)
+```
+
+REST routes: `GET /healthz`, `GET/POST /v1/caches`, `GET/DELETE /v1/caches/{id}`,
+`POST /v1/caches/{id}/{pin,unpin,ttl}`, `GET /v1/stats`.
 
 ## API surface
 
@@ -117,9 +147,10 @@ from SGLang and vice-versa.
   - `.load(cache_id, *, num_chunks=None, worker_id=0) -> list[KVPayload]`
   - `.get / .exists / .list / .delete / .extend_ttl / .pin / .unpin / .sweep_expired / .stats`
   - low-level: `.put_chunk(...)`, `.commit(...)` (used by connectors)
-- Storage: `CPUBackend`, `DiskBackend`, `TieredBackend` (implement `StorageBackend` to add Redis/S3/…)
+- Storage: `CPUBackend`, `DiskBackend`, `RedisBackend`, `TieredBackend` (implement `StorageBackend` to add S3/…)
 - Payload: `KVPayload`, `RawSerializer`, `TorchSerializer`
 - Connectors: `ExplicitLMCacheConnector`, `SGLangExplicitCache`, `KVTransfer` (`DictKVTransfer`, `TorchKVTransfer`)
+- Management: `ControlServer` + `llmcache` CLI
 
 ## Tests
 

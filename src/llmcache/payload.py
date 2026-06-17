@@ -10,10 +10,13 @@ the connector boundary.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from .errors import SerializationError
+
+_MAGIC = b"LKVP1\n"
 
 
 @dataclass
@@ -29,6 +32,36 @@ class KVPayload:
     @property
     def nbytes(self) -> int:
         return len(self.data)
+
+
+def pack_payload(obj: "KVPayload") -> bytes:
+    """Serialize a payload (metadata header + data) for byte-oriented stores."""
+    header = json.dumps(
+        {
+            "num_tokens": obj.num_tokens,
+            "num_layers": obj.num_layers,
+            "fmt": obj.fmt,
+            "meta": obj.meta,
+        }
+    ).encode("utf-8")
+    return b"".join((_MAGIC, len(header).to_bytes(4, "little"), header, obj.data))
+
+
+def unpack_payload(blob: bytes) -> "KVPayload":
+    if blob[: len(_MAGIC)] != _MAGIC:
+        raise SerializationError("bad payload framing")
+    off = len(_MAGIC)
+    hlen = int.from_bytes(blob[off : off + 4], "little")
+    off += 4
+    header = json.loads(blob[off : off + hlen].decode("utf-8"))
+    off += hlen
+    return KVPayload(
+        data=blob[off:],
+        num_tokens=header["num_tokens"],
+        num_layers=header["num_layers"],
+        fmt=header["fmt"],
+        meta=header.get("meta", {}),
+    )
 
 
 @runtime_checkable

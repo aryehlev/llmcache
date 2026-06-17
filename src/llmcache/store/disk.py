@@ -7,17 +7,14 @@ backend and lets explicit caches persist across process restarts and exceed RAM.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ..payload import KVPayload
+from ..payload import KVPayload, pack_payload, unpack_payload
 from ..types import ChunkKey
 from .base import StorageBackend, StoreStats
-
-_MAGIC = b"LKVP1\n"
 
 
 class DiskBackend(StorageBackend):
@@ -36,22 +33,10 @@ class DiskBackend(StorageBackend):
     def put(self, key: ChunkKey, obj: KVPayload, *, pin: bool = False) -> None:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        header = json.dumps(
-            {
-                "num_tokens": obj.num_tokens,
-                "num_layers": obj.num_layers,
-                "fmt": obj.fmt,
-                "meta": obj.meta,
-                "size": obj.nbytes,
-            }
-        ).encode("utf-8")
         tmp = path.with_suffix(".tmp")
         with self._lock:
             with open(tmp, "wb") as f:
-                f.write(_MAGIC)
-                f.write(len(header).to_bytes(4, "little"))
-                f.write(header)
-                f.write(obj.data)
+                f.write(pack_payload(obj))
             os.replace(tmp, path)
             if pin:
                 self._pinned.add(key)
@@ -61,18 +46,7 @@ class DiskBackend(StorageBackend):
         if not path.exists():
             return None
         with open(path, "rb") as f:
-            if f.read(len(_MAGIC)) != _MAGIC:
-                return None
-            hlen = int.from_bytes(f.read(4), "little")
-            header = json.loads(f.read(hlen).decode("utf-8"))
-            data = f.read()
-        return KVPayload(
-            data=data,
-            num_tokens=header["num_tokens"],
-            num_layers=header["num_layers"],
-            fmt=header["fmt"],
-            meta=header.get("meta", {}),
-        )
+            return unpack_payload(f.read())
 
     def contains(self, key: ChunkKey) -> bool:
         return self._path(key).exists()
